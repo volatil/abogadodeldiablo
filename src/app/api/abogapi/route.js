@@ -11,7 +11,8 @@ const CAMPOS = [
   "etapa",
 ];
 
-const MODELOS_GEMINI = ["gemini-2.5-flash", "gemini-2.0-flash"];
+const MODELOS_GEMINI = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+const MAX_OUTPUT_TOKENS = 3072;
 
 function limpiarCampo(valor) {
   return String(valor ?? "").trim();
@@ -109,18 +110,31 @@ No digas que la idea es buena si no hay evidencia.
 `.trim();
 }
 
-function responderError(error, status = 500) {
-  return NextResponse.json({ error }, { status });
+function responderError(error, status = 500, extra = {}) {
+  return NextResponse.json({ error, status, ...extra }, { status });
 }
 
-function formatearErrorGemini(message, status) {
+function extraerRetryDelay(data, message) {
+  const retryDelay = data?.error?.details?.find(
+    (detail) =>
+      detail?.["@type"] === "type.googleapis.com/google.rpc.RetryInfo"
+  )?.retryDelay;
+
+  if (retryDelay) {
+    return retryDelay;
+  }
+
+  const retryMatch = message.match(/Please retry in ([^.]+(?:\.\d+)?s)/i);
+  return retryMatch?.[1] ?? "";
+}
+
+function formatearErrorGemini({ message, status, retryDelay }) {
   if (status === 429) {
-    const retryMatch = message.match(/Please retry in ([^.]+(?:\.\d+)?s)/i);
-    const retryText = retryMatch ? ` Reintenta en ${retryMatch[1]}.` : "";
+    const retryText = retryDelay ? ` Reintenta en ${retryDelay}.` : "";
 
     return (
-      "La API key de Gemini no tiene cuota disponible para este modelo o proyecto." +
-      " Revisa el plan, billing o limites de uso en Google AI Studio." +
+      "Gemini esta limitando esta API key o proyecto por cuota, billing, limite diario o limite por minuto." +
+      " Revisa los limites de uso en Google AI Studio." +
       retryText
     );
   }
@@ -146,6 +160,10 @@ async function consultarGemini({ apiKey, modelo, prompt }) {
           ],
         },
       ],
+      generationConfig: {
+        responseMimeType: "application/json",
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
+      },
     }),
   });
 
@@ -209,9 +227,12 @@ export async function POST(request) {
 
     const apiMessage =
       resultado.data.error?.message || "Gemini rechazo la solicitud.";
+    const retryDelay = extraerRetryDelay(resultado.data, apiMessage);
     ultimoError = {
       message: apiMessage,
       status: resultado.status || 502,
+      modelo,
+      retryDelay,
     };
 
     if (resultado.status !== 503 || modelo === MODELOS_GEMINI.at(-1)) {
@@ -226,8 +247,14 @@ export async function POST(request) {
   if (!resultado?.ok) {
     const message = ultimoError?.message || "Gemini rechazo la solicitud.";
     const status = ultimoError?.status || 502;
-    console.error("[abogapi] Gemini error:", message);
-    return responderError(formatearErrorGemini(message, status), status);
+    const modelo = ultimoError?.modelo || resultado?.modelo || "desconocido";
+    const retryDelay = ultimoError?.retryDelay || "";
+    console.error(`[abogapi] Gemini error (${modelo}):`, message);
+    return responderError(
+      formatearErrorGemini({ message, status, retryDelay }),
+      status,
+      { modelo, retryDelay }
+    );
   }
 
   const text = resultado.data.candidates?.[0]?.content?.parts?.[0]?.text;
