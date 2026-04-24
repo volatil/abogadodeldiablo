@@ -11,6 +11,8 @@ const CAMPOS = [
   "etapa",
 ];
 
+const MODELOS_GEMINI = ["gemini-2.5-flash", "gemini-2.0-flash"];
+
 function limpiarCampo(valor) {
   return String(valor ?? "").trim();
 }
@@ -111,6 +113,61 @@ function responderError(error, status = 500) {
   return NextResponse.json({ error }, { status });
 }
 
+function formatearErrorGemini(message, status) {
+  if (status === 429) {
+    const retryMatch = message.match(/Please retry in ([^.]+(?:\.\d+)?s)/i);
+    const retryText = retryMatch ? ` Reintenta en ${retryMatch[1]}.` : "";
+
+    return (
+      "La API key de Gemini no tiene cuota disponible para este modelo o proyecto." +
+      " Revisa el plan, billing o limites de uso en Google AI Studio." +
+      retryText
+    );
+  }
+
+  return `Gemini rechazo la solicitud: ${message}`;
+}
+
+async function consultarGemini({ apiKey, modelo, prompt }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            {
+              text: prompt,
+            },
+          ],
+        },
+      ],
+    }),
+  });
+
+  let data;
+
+  try {
+    data = await response.json();
+  } catch {
+    throw {
+      status: 502,
+      message: "Gemini devolvio una respuesta que no es JSON valido.",
+    };
+  }
+
+  return {
+    data,
+    modelo,
+    ok: response.ok && !data.error,
+    status: response.status,
+  };
+}
+
 export async function POST(request) {
   let input;
 
@@ -131,51 +188,52 @@ export async function POST(request) {
   }
 
   const prompt = construirPrompt(input);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
+  let resultado;
+  let ultimoError;
 
-  let response;
+  for (const modelo of MODELOS_GEMINI) {
+    try {
+      resultado = await consultarGemini({ apiKey, modelo, prompt });
+    } catch (error) {
+      console.error(`[abogapi] Error conectando con Gemini (${modelo}):`, error);
+      ultimoError = {
+        message: error.message || "No fue posible conectar con Gemini.",
+        status: error.status || 502,
+      };
+      break;
+    }
 
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                text: prompt,
-              },
-            ],
-          },
-        ],
-      }),
-    });
-  } catch (error) {
-    console.error("[abogapi] Error conectando con Gemini:", error);
-    return responderError("No fue posible conectar con Gemini.", 502);
+    if (resultado.ok) {
+      break;
+    }
+
+    const apiMessage =
+      resultado.data.error?.message || "Gemini rechazo la solicitud.";
+    ultimoError = {
+      message: apiMessage,
+      status: resultado.status || 502,
+    };
+
+    if (resultado.status !== 503 || modelo === MODELOS_GEMINI.at(-1)) {
+      break;
+    }
+
+    console.warn(
+      `[abogapi] ${modelo} respondio 503. Reintentando con modelo fallback.`
+    );
   }
 
-  let data;
-
-  try {
-    data = await response.json();
-  } catch {
-    return responderError("Gemini devolvio una respuesta que no es JSON valido.", 502);
+  if (!resultado?.ok) {
+    const message = ultimoError?.message || "Gemini rechazo la solicitud.";
+    const status = ultimoError?.status || 502;
+    console.error("[abogapi] Gemini error:", message);
+    return responderError(formatearErrorGemini(message, status), status);
   }
 
-  if (!response.ok || data.error) {
-    const apiMessage = data.error?.message || "Gemini rechazo la solicitud.";
-    console.error("[abogapi] Gemini error:", apiMessage);
-    return responderError(`Gemini rechazo la solicitud: ${apiMessage}`, response.status || 502);
-  }
-
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  const text = resultado.data.candidates?.[0]?.content?.parts?.[0]?.text;
 
   if (!text) {
-    console.error("[abogapi] Respuesta sin texto:", data);
+    console.error("[abogapi] Respuesta sin texto:", resultado.data);
     return responderError("La API no devolvio una respuesta valida.", 502);
   }
 
